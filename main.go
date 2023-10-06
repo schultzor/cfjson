@@ -13,6 +13,7 @@ import (
 	"os"
 	"reflect"
 	"runtime"
+	"strconv"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -22,9 +23,12 @@ const nanosPerSec = 1_000_000_000
 
 type filter func(*cfLog) bool
 
-var filters []filter
-var csvFieldIndexes []int
-var csvFieldNames []string
+var (
+	fieldmap     map[string]int
+	fieldnames   []string
+	fieldindexes []int
+	filters      []filter
+)
 
 // see https://developers.cloudflare.com/logs/reference/log-fields/zone/http_requests/
 type cfLog struct {
@@ -122,7 +126,7 @@ func (e *cfLog) parse(js string) error {
 func (e cfLog) toCsv() []string {
 	var ret []string
 	sv := reflect.ValueOf(e)
-	for _, idx := range csvFieldIndexes {
+	for _, idx := range fieldindexes {
 		fv := sv.Field(idx)
 		ret = append(ret, fmt.Sprint(fv.Interface()))
 	}
@@ -130,13 +134,15 @@ func (e cfLog) toCsv() []string {
 }
 
 func init() {
+	fieldmap = make(map[string]int)
 	var tmp cfLog
 	st := reflect.TypeOf(tmp)
 	for i := 0; i < st.NumField(); i++ {
 		f := st.Field(i)
 		if f.IsExported() {
-			csvFieldIndexes = append(csvFieldIndexes, i)
-			csvFieldNames = append(csvFieldNames, f.Name)
+			fieldindexes = append(fieldindexes, i)
+			fieldnames = append(fieldnames, f.Name)
+			fieldmap[f.Name] = i
 		}
 	}
 }
@@ -156,13 +162,6 @@ func (v *tstamp) Set(s string) error {
 	}
 	*v = tstamp(ts.UnixNano())
 	return nil
-}
-
-func addFilter[T comparable](v T, ff filter) {
-	var dval T
-	if v != dval {
-		filters = append(filters, ff)
-	}
 }
 
 func checkFilters(entry *cfLog) bool {
@@ -188,54 +187,84 @@ func decode(input <-chan string, output chan<- *cfLog) error {
 	return nil
 }
 
+// using reflection to grab struct field values at runtime is slow
+// but we're running parallel decoders so maybe the runtime penalty is ok
+// in exchange for cutting down the amount of flag-processing code?
+
+func getStringFilter(fieldName string) func(string) error {
+	return func(argValue string) error {
+		// TODO: parse value string for things like "!", "~", etc, handle lists of values?
+		idx, ok := fieldmap[fieldName]
+		if !ok {
+			return fmt.Errorf("no log field named %q available", fieldName)
+		}
+
+		filters = append(filters, func(l *cfLog) bool {
+			v := reflect.ValueOf(*l).Field(idx).String()
+			return v == argValue
+		})
+		return nil
+	}
+}
+
+func getIntFilter(fieldName string) func(string) error {
+	return func(argValue string) error {
+		// TODO: parse value string for things like "!", "~", "<", ">", etc
+		idx, ok := fieldmap[fieldName]
+		if !ok {
+			return fmt.Errorf("no log field named %q available", fieldName)
+		}
+		argInt, err := strconv.ParseInt(argValue, 10, 0)
+		if err != nil {
+			return fmt.Errorf("error parsing %q to int: %w", argValue, err)
+		}
+
+		filters = append(filters, func(l *cfLog) bool {
+			v := reflect.ValueOf(*l).Field(idx).Int()
+			return v == argInt
+		})
+		return nil
+	}
+}
+
 func main() {
+	procStart := time.Now().UTC()
 	log.SetPrefix("cfjson:")
 	log.SetFlags(0)
-
-	procStart := time.Now().UTC()
 	var start, end tstamp
-	doCsv := flag.Bool("csv", false, "emit csv output instead of json")
-	edgeResponseStatus := flag.Int("status", 0, "match EdgeResponseStatus")
-	clientRequestPath := flag.String("reqpath", "", "match ClientRequestPath")
-	clientRequestSource := flag.String("reqsource", "", "match ClientRequestSource")
-	clientRequestHost := flag.String("reqhost", "", "optional ClientRequestHost filter")
-	rayId := flag.String("ray", "", "match RayID or ParentRayID field")
-	cacheStatus := flag.String("cachestatus", "", "match on CacheCacheStatus")
 	flag.Var(&start, "start", "optional time range start, e.g. "+procStart.Add(-1*time.Hour).Format(time.RFC3339))
 	flag.Var(&end, "end", "optional time range end, e.g. "+procStart.Format(time.RFC3339))
+	doCsv := flag.Bool("csv", false, "emit csv output instead of json")
 	decoders := flag.Int("decoders", max(1, runtime.NumCPU()/2), "number of decoder goroutines to run")
+	flag.Func("contenttype", "match on EdgeResponseContentType field", getStringFilter("EdgeResponseContentType"))
+	flag.Func("pathingstatus", "match on EdgePathingStatus", getStringFilter("EdgePathingStatus"))
+	flag.Func("status", "match on EdgeResponseStatus", getIntFilter("EdgeResponseStatus"))
+	flag.Func("originstatus", "match on OriginResponseStatus", getIntFilter("OriginResponseStatus"))
+	flag.Func("method", "match on ClientRequestMethod", getStringFilter("ClientRequestMethod"))
+	flag.Func("path", "match on ClientRequestPath", getStringFilter("ClientRequestPath"))
+	flag.Func("source", "match on ClientRequestSource", getStringFilter("ClientRequestSource"))
+	flag.Func("host", "match on ClientRequestHost", getStringFilter("ClientRequestHost"))
+	flag.Func("ray", "match on RayID", getStringFilter("RayID"))
+	flag.Func("parentray", "match on ParentRayID", getStringFilter("ParentRayID"))
+	flag.Func("cachestatus", "match on CacheCacheStatus", getStringFilter("CacheCacheStatus"))
 	flag.Parse()
 
 	var csvOut *csv.Writer
 	if *doCsv {
 		csvOut = csv.NewWriter(os.Stdout)
-		csvOut.Write(csvFieldNames)
+		csvOut.Write(fieldnames)
 		defer csvOut.Flush()
 	}
-	addFilter(*cacheStatus, func(l *cfLog) bool {
-		return l.CacheCacheStatus == *cacheStatus
-	})
-	addFilter(*rayId, func(l *cfLog) bool {
-		return l.RayID == *rayId || l.ParentRayID == *rayId
-	})
-	addFilter(*edgeResponseStatus, func(l *cfLog) bool {
-		return l.EdgeResponseStatus == *edgeResponseStatus
-	})
-	addFilter(*clientRequestPath, func(l *cfLog) bool {
-		return l.ClientRequestPath == *clientRequestPath
-	})
-	addFilter(*clientRequestSource, func(l *cfLog) bool {
-		return l.ClientRequestSource == *clientRequestSource
-	})
-	addFilter(*clientRequestHost, func(l *cfLog) bool {
-		return l.ClientRequestHost == *clientRequestHost
-	})
-	addFilter(start, func(l *cfLog) bool {
-		return l.EdgeStartTimestamp >= int64(start)
-	})
-	addFilter(end, func(l *cfLog) bool {
-		return l.EdgeStartTimestamp <= int64(end)
-	})
+	if start != 0 {
+		filters = append(filters, func(l *cfLog) bool {
+			return l.EdgeStartTimestamp >= int64(start)
+		})
+	}
+	if end != 0 {
+		filters = append(filters, func(l *cfLog) bool {
+			return l.EdgeStartTimestamp <= int64(end)
+		})
+	}
 
 	input := make(chan string, 100)
 	output := make(chan *cfLog, 100)
@@ -254,7 +283,7 @@ func main() {
 			if csvOut != nil {
 				csvOut.Write(e.toCsv())
 			} else {
-				os.Stdout.WriteString(*e.src)
+				fmt.Println(*e.src)
 			}
 		}
 		return nil
