@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -29,6 +30,20 @@ var (
 	fieldindexes []int
 	filters      []filter
 )
+
+type arrayFlags []string
+
+func (i *arrayFlags) String() string {
+	if i == nil {
+		return ""
+	}
+	return strings.Join(*i, ",")
+}
+
+func (i *arrayFlags) Set(value string) error {
+	*i = append(*i, value)
+	return nil
+}
 
 // see https://developers.cloudflare.com/logs/reference/log-fields/zone/http_requests/
 type cfLog struct {
@@ -232,6 +247,8 @@ func main() {
 	log.SetPrefix("cfjson:")
 	log.SetFlags(0)
 	var start, end tstamp
+	var clickhouse bool
+	var folders arrayFlags
 	flag.Var(&start, "start", "optional time range start, e.g. "+procStart.Add(-1*time.Hour).Format(time.RFC3339))
 	flag.Var(&end, "end", "optional time range end, e.g. "+procStart.Format(time.RFC3339))
 	doCsv := flag.Bool("csv", false, "emit csv output instead of json")
@@ -247,7 +264,13 @@ func main() {
 	flag.Func("ray", "match on RayID", getStringFilter("RayID"))
 	flag.Func("parentray", "match on ParentRayID", getStringFilter("ParentRayID"))
 	flag.Func("cachestatus", "match on CacheCacheStatus", getStringFilter("CacheCacheStatus"))
+	flag.BoolVar(&clickhouse, "clickhouse", false, "instead of CSV, load data into clickhouse then exit")
+	flag.Var(&folders, "folder", "folder to load into clickhouse")
 	flag.Parse()
+	if clickhouse {
+		loadClickhouse(folders)
+		return
+	}
 
 	var csvOut *csv.Writer
 	if *doCsv {
