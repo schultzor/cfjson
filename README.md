@@ -1,7 +1,8 @@
 # Load S3 logs into local clickhouse
 
 ```shell
+go install .
 docker-compose up -d
-
-go run main.go -clickhouse -folder <path-to-folder-with-unzipped-s3-log-data>
+cd ./path/to/cloudflare/logs/
+gzcat *.log.gz | cfjson -ch
 ```

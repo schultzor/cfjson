@@ -5,10 +5,13 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/csv"
+	"encoding/gob"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"reflect"
@@ -127,6 +130,7 @@ type cfLog struct {
 	ZoneID                                int
 	ZoneName                              string
 
+	// non-exported/internal fields
 	src *string // string entry was parsed from
 }
 
@@ -242,17 +246,74 @@ func getIntFilter(fieldName string) func(string) error {
 	}
 }
 
+type emitter func(e *cfLog) error
+
+type logReader interface {
+	readAll(io.Reader, chan<- *cfLog) (int64, error)
+}
+
+type jsonReader struct {
+	decoderCount int
+}
+
+func (j *jsonReader) readAll(input io.Reader, output chan<- *cfLog) (int64, error) {
+	var group errgroup.Group
+	var count int64
+	log.Printf("running %d json decoders", j.decoderCount)
+	lines := make(chan string, 100)
+	for i := 0; i < j.decoderCount; i++ {
+		group.Go(func() error {
+			return decode(lines, output)
+		})
+	}
+	scanner := bufio.NewScanner(input)
+	for scanner.Scan() {
+		lines <- scanner.Text()
+		count++
+	}
+	close(lines)
+	if err := scanner.Err(); err != nil {
+		return count, err
+	}
+	return count, group.Wait()
+}
+
+type gobReader struct{}
+
+func (g *gobReader) readAll(input io.Reader, output chan<- *cfLog) (int64, error) {
+	var count int64
+	decoder := gob.NewDecoder(input)
+	for {
+		var entry cfLog
+		err := decoder.Decode(&entry)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return count, err
+		}
+		count++
+		output <- &entry
+	}
+	return count, nil
+}
+
 func main() {
 	procStart := time.Now().UTC()
 	log.SetPrefix("cfjson:")
 	log.SetFlags(0)
 	var start, end tstamp
-	var clickhouse bool
-	var folders arrayFlags
 	flag.Var(&start, "start", "optional time range start, e.g. "+procStart.Add(-1*time.Hour).Format(time.RFC3339))
 	flag.Var(&end, "end", "optional time range end, e.g. "+procStart.Format(time.RFC3339))
-	doCsv := flag.Bool("csv", false, "emit csv output instead of json")
+	gobIn := flag.Bool("b", false, "read gob binary input instead of json")
+	gobOut := flag.Bool("gob", false, "emit gob binary output instead of json")
+	csvOut := flag.Bool("csv", false, "emit csv output instead of json")
+
+	chOut := flag.Bool("ch", false, "load data into local clickhouse instance")
+	chBatchSize := flag.Int("chbatch", 1000, "clickhouse insert batch size")
+	chTableName := flag.String("chtable", "cloudflare", "clickhouse table name to insert logs into")
+
 	decoders := flag.Int("decoders", max(1, runtime.NumCPU()/2), "number of decoder goroutines to run")
+	flag.Func("colo", "match on EdgeColoCode field", getStringFilter("EdgeColoCode"))
 	flag.Func("contenttype", "match on EdgeResponseContentType field", getStringFilter("EdgeResponseContentType"))
 	flag.Func("pathingstatus", "match on EdgePathingStatus", getStringFilter("EdgePathingStatus"))
 	flag.Func("status", "match on EdgeResponseStatus", getIntFilter("EdgeResponseStatus"))
@@ -264,20 +325,8 @@ func main() {
 	flag.Func("ray", "match on RayID", getStringFilter("RayID"))
 	flag.Func("parentray", "match on ParentRayID", getStringFilter("ParentRayID"))
 	flag.Func("cachestatus", "match on CacheCacheStatus", getStringFilter("CacheCacheStatus"))
-	flag.BoolVar(&clickhouse, "clickhouse", false, "instead of CSV, load data into clickhouse then exit")
-	flag.Var(&folders, "folder", "folder to load into clickhouse")
 	flag.Parse()
-	if clickhouse {
-		loadClickhouse(folders)
-		return
-	}
 
-	var csvOut *csv.Writer
-	if *doCsv {
-		csvOut = csv.NewWriter(os.Stdout)
-		csvOut.Write(fieldnames)
-		defer csvOut.Flush()
-	}
 	if start != 0 {
 		filters = append(filters, func(l *cfLog) bool {
 			return l.EdgeStartTimestamp >= int64(start)
@@ -288,39 +337,67 @@ func main() {
 			return l.EdgeStartTimestamp <= int64(end)
 		})
 	}
+	ctx := context.Background()
 
-	input := make(chan string, 100)
-	output := make(chan *cfLog, 100)
-
-	log.Printf("running %d decoders", *decoders)
-	var decoderGroup errgroup.Group
-	for i := 0; i < *decoders; i++ {
-		decoderGroup.Go(func() error {
-			return decode(input, output)
-		})
+	// pick output writer type
+	var emit emitter
+	switch {
+	case *chOut:
+		chw, err := newClickhouseWriter(ctx, *chTableName, *chBatchSize)
+		if err != nil {
+			log.Fatalf("error creating clickhouse writer: %w", err)
+		}
+		defer chw.Flush()
+		emit = func(e *cfLog) error {
+			err := chw.Write(ctx, e)
+			if err != nil {
+				log.Fatal("ch error:", err)
+			}
+			return err
+		}
+	case *csvOut:
+		csvWriter := csv.NewWriter(os.Stdout)
+		csvWriter.Write(fieldnames)
+		defer csvWriter.Flush()
+		emit = func(e *cfLog) error {
+			return csvWriter.Write(e.toCsv())
+		}
+	case *gobOut:
+		gobOut := gob.NewEncoder(os.Stdout)
+		emit = func(e *cfLog) error {
+			return gobOut.Encode(*e)
+		}
+	default:
+		emit = func(e *cfLog) error {
+			if e.src != nil {
+				fmt.Println(*e.src)
+			} else {
+				fmt.Println(e)
+			}
+			return nil
+		}
 	}
-
+	logEntries := make(chan *cfLog, 100)
 	var writerGroup errgroup.Group
 	writerGroup.Go(func() error {
-		for e := range output {
-			if csvOut != nil {
-				csvOut.Write(e.toCsv())
-			} else {
-				fmt.Println(*e.src)
-			}
+		for e := range logEntries {
+			emit(e)
 		}
 		return nil
 	})
-	var count int
-	scanner := bufio.NewScanner(os.Stdin)
-	for scanner.Scan() {
-		line := scanner.Text()
-		input <- line
-		count++
+
+	// pick input type
+	var reader logReader
+	if *gobIn {
+		reader = &gobReader{}
+	} else {
+		reader = &jsonReader{*decoders}
 	}
-	close(input)
-	decoderGroup.Wait()
-	close(output)
+	count, err := reader.readAll(os.Stdin, logEntries)
+	if err != nil {
+		log.Fatalf("error reading input: %v", err)
+	}
+	close(logEntries)
 	writerGroup.Wait()
-	log.Printf("read %d lines in %v", count, time.Since(procStart))
+	log.Printf("read %d entries in %v", count, time.Since(procStart))
 }
