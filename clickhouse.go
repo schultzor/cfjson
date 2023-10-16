@@ -190,7 +190,8 @@ func loadClickhouse(foldersWithUnzippedS3Logs []string) {
 		CREATE TABLE IF NOT EXISTS %s (
 			%s
 		) Engine = MergeTree
-	`, (&cfLog{}).ClickHouseSchema(), tableName))
+		PRIMARY KEY RayID
+	`, tableName, (&cfLog{}).ClickHouseSchema()))
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -199,7 +200,7 @@ func loadClickhouse(foldersWithUnzippedS3Logs []string) {
 }
 
 func loadFolder(ctx context.Context, conn clickhouse.Conn, dirName string) {
-	batch, err := conn.PrepareBatch(ctx, "INSERT INTO cloudflare")
+	batch, err := conn.PrepareBatch(ctx, fmt.Sprintf("INSERT INTO %s", dirName))
 	if err != nil {
 		log.Fatal(err)
 	}
