@@ -4,23 +4,121 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
-	"os"
-	"path"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
-	"github.com/manifoldco/promptui"
-	"github.com/schollz/progressbar/v3"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
+
+type clickhouseWriter struct {
+	tableName string
+	batch     driver.Batch
+	conn      clickhouse.Conn
+	batchSize int
+}
+
+func newClickhouseWriter(ctx context.Context, tableName string, batchSize int) (*clickhouseWriter, error) {
+	dialCount := 0
+	// TODO: pass all the host/port/db/user values via params here from argv
+	conn, err := clickhouse.Open(&clickhouse.Options{
+		Addr: []string{"127.0.0.1:9000"},
+		Auth: clickhouse.Auth{
+			Database: "default",
+			Username: "default",
+			Password: "",
+		},
+		DialContext: func(ctx context.Context, addr string) (net.Conn, error) {
+			dialCount++
+			var d net.Dialer
+			return d.DialContext(ctx, "tcp", addr)
+		},
+		Debug: false, // TODO: set from param
+		Debugf: func(format string, v ...any) {
+			log.Printf(format, v)
+		},
+		Settings: clickhouse.Settings{
+			"max_execution_time": 60,
+		},
+		Compression: &clickhouse.Compression{
+			Method: clickhouse.CompressionLZ4,
+		},
+		DialTimeout:          time.Second * 30,
+		MaxOpenConns:         5,
+		MaxIdleConns:         5,
+		ConnMaxLifetime:      time.Duration(10) * time.Minute,
+		ConnOpenStrategy:     clickhouse.ConnOpenInOrder,
+		BlockBufferSize:      10,
+		MaxCompressionBuffer: 10240,
+		ClientInfo: clickhouse.ClientInfo{ // optional, please see Client info section in the README.md
+			Products: []struct {
+				Name    string
+				Version string
+			}{
+				{Name: "cfjson", Version: "0.1"},
+			},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := conn.Exec(ctx, fmt.Sprintf(`
+CREATE TABLE IF NOT EXISTS %s
+( %s )
+Engine = MergeTree
+PRIMARY KEY RayID
+`,
+		tableName,
+		(&cfLog{}).ClickHouseSchema())); err != nil {
+		return nil, err
+	}
+	return &clickhouseWriter{
+		tableName: tableName,
+		conn:      conn,
+		batchSize: batchSize,
+	}, nil
+
+}
+
+func (w *clickhouseWriter) createBatch(ctx context.Context) error {
+	if w.batch == nil {
+		b, err := w.conn.PrepareBatch(ctx, fmt.Sprintf("INSERT INTO %s", w.tableName))
+		if err != nil {
+			return fmt.Errorf("error creating batch: %w", err)
+		}
+		w.batch = b
+	}
+	return nil
+}
+
+func (w *clickhouseWriter) Write(ctx context.Context, e *cfLog) error {
+	if err := w.createBatch(ctx); err != nil {
+		return err
+	}
+	if err := w.batch.Append(e.Row()...); err != nil {
+		return err
+	}
+	if w.batch.Rows() >= w.batchSize {
+		if err := w.batch.Send(); err != nil {
+			return err
+		}
+		w.batch = nil
+	}
+	return nil
+}
+
+func (w *clickhouseWriter) Flush() error {
+	if w.batch != nil {
+		return w.batch.Send()
+	}
+	return nil
+}
 
 func (c *cfLog) ClickHouseSchema() string {
 	results := []string{}
@@ -122,118 +220,4 @@ func (c *cfLog) Row() []any {
 		}
 	}
 	return results
-}
-
-func loadClickhouse(foldersWithUnzippedS3Logs []string) {
-	ctx := context.Background()
-	dialCount := 0
-	conn, err := clickhouse.Open(&clickhouse.Options{
-		Addr: []string{"127.0.0.1:9000"},
-		Auth: clickhouse.Auth{
-			Database: "default",
-			Username: "default",
-			Password: "",
-		},
-		DialContext: func(ctx context.Context, addr string) (net.Conn, error) {
-			dialCount++
-			var d net.Dialer
-			return d.DialContext(ctx, "tcp", addr)
-		},
-		Debug: true,
-		Debugf: func(format string, v ...any) {
-			fmt.Printf(format, v)
-		},
-		Settings: clickhouse.Settings{
-			"max_execution_time": 60,
-		},
-		Compression: &clickhouse.Compression{
-			Method: clickhouse.CompressionLZ4,
-		},
-		DialTimeout:          time.Second * 30,
-		MaxOpenConns:         5,
-		MaxIdleConns:         5,
-		ConnMaxLifetime:      time.Duration(10) * time.Minute,
-		ConnOpenStrategy:     clickhouse.ConnOpenInOrder,
-		BlockBufferSize:      10,
-		MaxCompressionBuffer: 10240,
-		ClientInfo: clickhouse.ClientInfo{ // optional, please see Client info section in the README.md
-			Products: []struct {
-				Name    string
-				Version string
-			}{
-				{Name: "my-app", Version: "0.1"},
-			},
-		},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	for _, folder := range foldersWithUnzippedS3Logs {
-		tableName := filepath.Base(folder)
-		if tableName == "" {
-			prompt := promptui.Prompt{
-				Label: fmt.Sprintf("Please enter a table name for s3 data at path: %s", folder),
-			}
-
-			result, err := prompt.Run()
-			if err != nil {
-				log.Fatal(err)
-			}
-			tableName = result
-		}
-		// This is only if you want to drop the tables before adding them
-		// if err := conn.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", tableName)); err != nil {
-		// 	log.Fatal(err)
-		// }
-		err = conn.Exec(ctx, fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %s (
-			%s
-		) Engine = MergeTree
-	`, (&cfLog{}).ClickHouseSchema(), tableName))
-		if err != nil {
-			log.Fatal(err)
-		}
-		loadFolder(ctx, conn, folder)
-	}
-}
-
-func loadFolder(ctx context.Context, conn clickhouse.Conn, dirName string) {
-	batch, err := conn.PrepareBatch(ctx, "INSERT INTO cloudflare")
-	if err != nil {
-		log.Fatal(err)
-	}
-	dirs, err := os.ReadDir(dirName)
-	if err != nil {
-		log.Fatal(err)
-	}
-	bar := progressbar.Default(int64(len(dirs)))
-	for _, dir := range dirs {
-		bar.Add(1)
-		if !dir.IsDir() && strings.HasSuffix(dir.Name(), ".log") {
-			f, err := os.Open(path.Join(dirName, dir.Name()))
-			if err != nil {
-				log.Fatal(err)
-			}
-			defer f.Close()
-			s := bufio.NewScanner(f)
-			for s.Scan() {
-				line := s.Text()
-				logLine := cfLog{}
-				err = json.Unmarshal([]byte(line), &logLine)
-				if err != nil {
-					log.Fatal(err)
-				}
-				err = batch.Append(logLine.Row()...)
-				if err != nil {
-					log.Fatal(err)
-				}
-			}
-		}
-	}
-	bar.Finish()
-	err = batch.Send()
-	if err != nil {
-		log.Fatal(err)
-	}
 }
