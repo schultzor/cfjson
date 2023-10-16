@@ -1,6 +1,6 @@
 module github.com/schultzor/cfjson
 
-go 1.21.1
+go 1.21
 
 require (
 	github.com/ClickHouse/ch-go v0.58.2 // indirect
