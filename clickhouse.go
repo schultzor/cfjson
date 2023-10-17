@@ -24,16 +24,12 @@ type clickhouseWriter struct {
 	batchSize int
 }
 
-func newClickhouseWriter(ctx context.Context, tableName string, batchSize int) (*clickhouseWriter, error) {
+func newClickhouseWriter(ctx context.Context, addr string, auth clickhouse.Auth, tableName string, batchSize int) (*clickhouseWriter, error) {
 	dialCount := 0
 	// TODO: pass all the host/port/db/user values via params here from argv
 	conn, err := clickhouse.Open(&clickhouse.Options{
-		Addr: []string{"127.0.0.1:9000"},
-		Auth: clickhouse.Auth{
-			Database: "default",
-			Username: "default",
-			Password: "",
-		},
+		Addr: []string{addr},
+		Auth: auth,
 		DialContext: func(ctx context.Context, addr string) (net.Conn, error) {
 			dialCount++
 			var d net.Dialer
@@ -83,7 +79,6 @@ PRIMARY KEY RayID
 		conn:      conn,
 		batchSize: batchSize,
 	}, nil
-
 }
 
 func (w *clickhouseWriter) createBatch(ctx context.Context) error {

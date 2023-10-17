@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -312,6 +313,13 @@ func main() {
 	chBatchSize := flag.Int("chbatch", 1000, "clickhouse insert batch size")
 	chTableName := flag.String("chtable", "cloudflare", "clickhouse table name to insert logs into")
 
+	chHost := flag.String("chhost", "127.0.0.1", "clickhouse host")
+	chPort := flag.Int("chport", 9000, "clickhouse port")
+
+	chDatabase := flag.String("chdatabase", "default", "clickhouse database")
+	chUsername := flag.String("chuser", "default", "clickhouse username")
+	chPassword := flag.String("chpassword", "", "clickhouse password")
+
 	decoders := flag.Int("decoders", max(1, runtime.NumCPU()/2), "number of decoder goroutines to run")
 	flag.Func("colo", "match on EdgeColoCode field", getStringFilter("EdgeColoCode"))
 	flag.Func("contenttype", "match on EdgeResponseContentType field", getStringFilter("EdgeResponseContentType"))
@@ -343,7 +351,12 @@ func main() {
 	var emit emitter
 	switch {
 	case *chOut:
-		chw, err := newClickhouseWriter(ctx, *chTableName, *chBatchSize)
+		chAuth := clickhouse.Auth{
+			Database: *chDatabase,
+			Username: *chUsername,
+			Password: *chPassword,
+		}
+		chw, err := newClickhouseWriter(ctx, fmt.Sprintf("%s:%d", *chHost, *chPort), chAuth, *chTableName, *chBatchSize)
 		if err != nil {
 			log.Fatalf("error creating clickhouse writer: %w", err)
 		}
